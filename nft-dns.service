@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/nft-dns.py
+ExecStart=/opt/nft-dns/nft-dns.py
 Restart=on-failure
 
 [Install]
