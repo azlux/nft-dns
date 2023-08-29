@@ -1,0 +1,13 @@
+[Unit]
+Description=NFTABLES DNS support
+DefaultDependencies=no
+After=nftables.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nft-dns.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

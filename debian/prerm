@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+case "$1" in
+    upgrade)
+        [ -d  /run/systemd/system/ ] && systemctl stop nft-dns
+        exit 0
+        ;;
+    remove)
+        [ -d  /run/systemd/system/ ] && systemctl stop nft-dns
+        [ -d  /run/systemd/system/ ] && systemctl disable nft-dns
+        exit 0
+        ;;
+    *)
+        ;;
+esac

@@ -1,0 +1,10 @@
+Package: nft-dns
+Version: VERSION-TO-REPLACE
+Section: net
+Priority: optional
+Architecture: all
+Maintainer: Azlux <github@azlux.fr>
+Description: Make nftables resolve fqdn on-the-fly
+Homepage: https://github.com/azlux/nft-dns
+Bugs: https://github.com/azlux/nft-dns/issues
+Depends: nftables, python3, python3-dnspython, python3-pydantics

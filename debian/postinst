@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+[ -d  /run/systemd/system/ ] && systemctl daemon-reload
+[ -d  /run/systemd/system/ ] && systemctl is-enabled nft-dns --quiet >/dev/null 2>&1 && systemctl restart nft-dns
+
+exit 0
