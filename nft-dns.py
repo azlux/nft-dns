@@ -19,14 +19,14 @@ config = configparser.ConfigParser(interpolation=None)
 
 values = []
 stop = False
+logging.basicConfig(format='%(asctime)s %(levelname)s:%(message)s')
+logging.getLogger().setLevel(logging.INFO)
 
 
 def read_config():
-    have_config = False
     if args.config_file and Path(args.config_file).is_file():
-        print(f'Reading config file : {Path(args.config_file).absolute()}', flush=True)
+        logging.info(f'Reading config file : {Path(args.config_file).absolute()}')
         config.read(Path(args.config_file))
-        have_config = True
     else:
         logging.error('Config file not found, Exiting...')
         exit(1)
@@ -35,12 +35,11 @@ def read_config():
         if not config_dir.is_dir():
             logging.error(f"Config directory is not a directory, Ignoring...")
         else:
-            print('Only config file with prefix .conf is read')
-            print(f"Reading config directory : {config_dir.absolute()}", flush=True)
+            logging.info('Only config file with prefix .conf is read')
+            logging.info(f"Reading config directory : {config_dir.absolute()}")
             list_config = list(config_dir.glob("*.conf"))
-            [print(f"   {i}", flush=True) for i in list_config]
+            [logging.info(f"   {i}") for i in list_config]
             config.read(list_config)
-    logging.basicConfig(format='%(asctime)s %(levelname)s:%(message)s')
     logging.info("# Parsing the configuration")
     if args.verbose or (config.has_option('GLOBAL', 'verbose') and config['GLOBAL'].getboolean('verbose')):
         logging.getLogger().setLevel(logging.DEBUG)
@@ -84,7 +83,6 @@ def read_config():
 
 def update_dns() -> None:
     global values
-    logging.info("# Resolving the fqdn entries")
     if config.has_option('GLOBAL', 'custom_resolver'):
         res = dns.resolver.make_resolver_at(config['GLOBAL']['custom_resolver'])
     else:
@@ -113,7 +111,10 @@ def update_dns() -> None:
             continue
         logging.debug(i)
         if old_ip_list != i.ip_list:
+            logging.info(f"Updating the IPv{i.typeof} for {i.fqdn} with {i.ip_list}")
             apply_config_entry(i, old_ip_list=old_ip_list)
+        else:
+            logging.info(f"Nothing have change for the IPv{i.typeof} for {i.fqdn}")
     values = [i for i in values if i.ip_list is not None]
 
 
