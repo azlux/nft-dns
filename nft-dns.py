@@ -124,10 +124,16 @@ def get_next_run_timer() -> datetime:
 
 def apply_config_entry(one_entry: entry.ModelEntry, old_ip_list: List[IPvAnyAddress] | None) -> None:
     if old_ip_list:
-        run_command(f"nft delete element filter {one_entry.set_name} " + "{" + f"{', '.join([str(ip) for ip in old_ip_list])}" + "}")
+        run_command(f"nft delete element filter {one_entry.set_name} {{{', '.join([str(ip) for ip in old_ip_list])}}}")
 
     if one_entry.ip_list:
-        run_command(f"nft add element filter {one_entry.set_name} " + "{" + f"{', '.join([str(ip) for ip in one_entry.ip_list])}" + "}")
+        run_command(f"nft add element filter {one_entry.set_name} {{{', '.join([str(ip) for ip in one_entry.ip_list])}}}")
+
+
+def remove_config_entries():
+    logging.info("Cleaning all entries")
+    for i in values:
+        run_command(f"nft delete element filter {i.set_name} {{{', '.join([str(ip) for ip in i.ip_list])}}}")
 
 
 def run_command(cmd: str) -> str:
@@ -156,6 +162,7 @@ def run_loop():
         for i in range(sleep_second):
             sleep(1)
             if stop:
+                remove_config_entries()
                 break
         if stop:
             break

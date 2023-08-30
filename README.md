@@ -6,7 +6,7 @@ Back on iptables, fqdn was available into rules, but was resolved at start only.
 This project try to resolve this limitation.
 NFT-DNS start with it own configuration file, will resolve the DNS and keep the TTL, then will populate the NFT [named SET](https://wiki.nftables.org/wiki-nftables/index.php/Sets#Named_sets_specifications).
 
-The script will make DNS query each time the TTL reach zero, this way, your system will resolve the entries accept (or refused) by your firewall, even if the domain have change it IP.
+The script will make DNS query each time the TTL reach zero, this way, your system will resolve an entries already accepted (or refused) by your firewall, even if the domain have changed its IP.
 The script is both IPv4 and IPv6 compatible.
 
 -----
@@ -25,6 +25,14 @@ The script is both IPv4 and IPv6 compatible.
 - Packaged with apt
   - upgrade with APT 
   - Service packaged with systemd
+## Requirements
+
+To use this program you need:
+- At least **Debian 12** (I code with Pydantic Model (> 5.0))
+- A NFTABLES with **already prepared** [named SET](https://wiki.nftables.org/wiki-nftables/index.php/Sets#Named_sets_specifications).
+  - If the set doesn't exist, the program will stop itself.
+  - For testing, you can have sets you don't call into a rule
+- If your OS have systemd, the package will prepare the systemd service too.
 
 ## Installation
 ### With APT (recommended)
@@ -60,4 +68,3 @@ Use `man nft-dns` to get the config help
 
 ## TODO
 1. pcap capture (as option) to support true wildcard
-2. MAN page
