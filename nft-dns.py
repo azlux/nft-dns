@@ -72,7 +72,7 @@ def read_config():
     for set_name in list_set:
         res = run_command(f"nft list set filter {set_name}")
         if not args.dry_run:
-            if "ipv4_addr" in res or "ipv4_addr" in res:
+            if "ipv4_addr" in res or "ipv6_addr" in res:
                 logging.debug(f"set {set_name} well defined")
             else:
                 logging.error(f'Type of the {set_name} set, not defined on "ipv4_addr" or "ipv6_addr"')
@@ -134,7 +134,7 @@ def run_command(cmd: str) -> str:
     logging.debug(f"Command to run : {cmd}")
     if not args.dry_run:
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True, shell=True)
             return res.stdout
         except subprocess.CalledProcessError as e:
             logging.error(e.stdout)
