@@ -71,7 +71,7 @@ def read_config():
     list_set = list(set([i.set_name for i in values]))  # get all nft named set once
     for set_name in list_set:
         res = run_command(f"nft list set filter {set_name}")
-        if not args.dry_run:
+        if not (args.dry_run or (config.has_option('GLOBAL', 'verbose') and config['GLOBAL'].getboolean('dry_run', fallback=False))):
             if "ipv4_addr" in res or "ipv6_addr" in res:
                 logging.debug(f"set {set_name} well defined")
             else:
@@ -132,7 +132,7 @@ def apply_config_entry(one_entry: entry.ModelEntry, old_ip_list: List[IPvAnyAddr
 
 def run_command(cmd: str) -> str:
     logging.debug(f"Command to run : {cmd}")
-    if not args.dry_run:
+    if not (args.dry_run or (config.has_option('GLOBAL', 'verbose') and config['GLOBAL'].getboolean('dry_run', fallback=False))):
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, check=True, shell=True)
             return res.stdout
