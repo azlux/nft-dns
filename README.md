@@ -13,7 +13,9 @@ The script is both IPv4 and IPv6 compatible.
 ## Quick Start Guide
 1. [Features](#features)
 2. [Installation](#installation)
-3. [TODO](#todo)
+3. [Configuration](#configuration)
+4. [Help](#help)
+5. [TODO](#todo)
 
 ## Features
 - FQDN support
@@ -26,24 +28,34 @@ The script is both IPv4 and IPv6 compatible.
 
 ## Installation
 ### With APT (recommended)
+```bash
     echo "deb [signed-by=/usr/share/keyrings/azlux-archive-keyring.gpg] http://packages.azlux.fr/debian/ bookworm main" | sudo tee /etc/apt/sources.list.d/azlux.list
     sudo wget -O /usr/share/keyrings/azlux-archive-keyring.gpg  https://azlux.fr/repo.gpg
     sudo apt update
     sudo apt install nft-dns
+    # Here you change the config
+    # Then you can start and enable the service
     sudo systemctl enable nft-dns
     sudo systemctl start nft-dns
+```
 
 ### Manually
-You can just clone the project, it's a one-script (`nft-dns.py`). But you will have not auto-update.
+You can just clone the project, the start script is `nft-dns.py`. But you will have not auto-update.
 You will need to create your one init service.
+You also need to install the dependencies with pip3 or debian packages.
+
+## Configuration
+You can write your own config file with [the manual](./MANUAL.md) (available also with `man nft-dns`)
+
+Read the manual for explanation of configs entries.
+
+You can also copy the `/etc/nft-dns.conf` file as a example, and uncomment values (`cp /etc/nft-dns.conf /etc/nft-dns.d/cutsom.conf`).
 
 ## Help
 ### Command line
 Use `nft-dns.py --help` to get the usage help.
 
 ### Man page
-TODO
-
 Use `man nft-dns` to get the config help
 
 ## TODO
