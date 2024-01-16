@@ -86,6 +86,7 @@ You need at least one section to make this program work. These sections cannot b
 - `set_name` (str)
 
   This is the Set Name you want to work with
+
 - `enable` (bool)
 
   no Default
@@ -96,9 +97,16 @@ You need at least one section to make this program work. These sections cannot b
   
   no Default
 
-  Choose between `ip`, `ip6` and `inet`. This specify the nftables "address family" used by the filter.
+  Choose between `ip`, `ip6` and `inet`. This specifie the nftables "address family" used by the filter.
+
+- `table` (str)
+
+  Default: `filter`
+
+  Tables can be specified to be in output, forward, or custom tables. The default is `filter` because it's the default table name on the debian package. 
 
 - `domains` (str)
+
   no Default
   
   This is the domain (fqdn) you want to resolve and added to your set.
