@@ -5,6 +5,7 @@ from pathlib import Path
 import configparser
 from time import sleep
 from typing import List
+import re
 
 import argparse
 import dns.resolver
@@ -48,16 +49,14 @@ def read_config():
     for section in config.sections():
         if section != 'GLOBAL' and config[section].getboolean('enable', fallback=False):
             for fqdn in config[section]["domains"].split(','):
-                if config[section]["typeof"] == "ipv4":
-                    type_of = 4
-                elif config[section]["typeof"] == "ipv6":
-                    type_of = 6
+                if config[section]["family"] in ['ip', 'ip6', 'inet'] :
+                    family = config[section]["family"]
                 else:
-                    print("Erreur de config")
+                    print(f"Erreur de config, family of {fqdn} not : ip, ip6 or inet")
                     exit(1)
                 result = entry.ModelEntry(
                     set_name=config[section]["set_name"],
-                    typeof=type_of,
+                    family=family,
                     fqdn=fqdn.strip(),
                     ip_list=None,
                     ttl=None,
@@ -68,15 +67,22 @@ def read_config():
     if len(values) == 0:
         logging.error("No entries configurated, I've nothing to do, Exiting in tears...")
         exit(1)
-    list_set = list(set([i.set_name for i in values]))  # get all nft named set once
-    for set_name in list_set:
-        res = run_command(f"nft list set filter {set_name}")
+    for one_entry in values:
+        res = run_command(f"nft list set {one_entry.family} filter {one_entry.set_name}")
         if not (args.dry_run or (config.has_option('GLOBAL', 'verbose') and config['GLOBAL'].getboolean('dry_run', fallback=False))):
-            if "ipv4_addr" in res or "ipv6_addr" in res:
-                logging.debug(f"set {set_name} well defined")
+            if "type ipv4_addr" in res :
+                one_entry.typeof = 4
+                logging.debug(f"set {one_entry.set_name} well defined in ipv4_addr family")
+            elif "type ipv6_addr" in res:
+                one_entry.typeof = 6
+                logging.debug(f"set {one_entry.set_name} well defined in ipv6_addr family")
             else:
-                logging.error(f'Type of the {set_name} set, not defined on "ipv4_addr" or "ipv6_addr"')
+                logging.error(f'Type of the {one_entry.set_name} set, not defined on "ipv4_addr" or "ipv6_addr"')
                 exit(1)
+            regex = r"table (\S+) filter"
+            match = re.search(regex, res, re.MULTILINE)
+            if match:
+                one_entry.family = match.group(1)
 
     logging.info("# End of Parsing")
 
@@ -124,16 +130,16 @@ def get_next_run_timer() -> datetime:
 
 def apply_config_entry(one_entry: entry.ModelEntry, old_ip_list: List[IPvAnyAddress] | None) -> None:
     if old_ip_list:
-        run_command(f"nft delete element filter {one_entry.set_name} {{{', '.join([str(ip) for ip in old_ip_list])}}}")
+        run_command(f"nft delete element {one_entry.family} filter {one_entry.set_name} {{{', '.join([str(ip) for ip in old_ip_list])}}}")
 
     if one_entry.ip_list:
-        run_command(f"nft add element filter {one_entry.set_name} {{{', '.join([str(ip) for ip in one_entry.ip_list])}}}")
+        run_command(f"nft add element {one_entry.family} filter {one_entry.set_name} {{{', '.join([str(ip) for ip in one_entry.ip_list])}}}")
 
 
 def remove_config_entries():
     logging.info("Cleaning all entries")
     for i in values:
-        run_command(f"nft delete element filter {i.set_name} {{{', '.join([str(ip) for ip in i.ip_list])}}}")
+        run_command(f"nft delete element {i.family} filter {i.set_name} {{{', '.join([str(ip) for ip in i.ip_list])}}}")
 
 
 def run_command(cmd: str) -> str:

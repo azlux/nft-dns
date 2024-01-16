@@ -92,11 +92,11 @@ You need at least one section to make this program work. These sections cannot b
   
   You need to specify if you want to activate this rule with `True` or keep it disabled with `False`
 
-- `typeof` (str)
+- `family` (str)
   
   no Default
 
-  Choose between `ipv4` or `ipv6`, cannot be both since nftables set are simple stack.
+  Choose between `ip`, `ip6` and `inet`. This specify the nftables "address family" used by the filter.
 
 - `domains` (str)
   no Default
