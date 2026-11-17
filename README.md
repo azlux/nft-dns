@@ -30,7 +30,7 @@ The script is both IPv4 and IPv6 compatible.
 
 ## Requirements
 To use this program you need:
-- At least **Debian 12** (I code with Pydantic Model (> 5.0))
+- At least **Debian 13** (I code with Pydantic Model (> 5.0))
 - A NFTABLES with an **already prepared** [named SET](https://wiki.nftables.org/wiki-nftables/index.php/Sets#Named_sets_specifications) (or more).
   - the named sets used here **NEED** to be **EXCLUSIVE** to nft-dns.
   - If the set doesn't exist, the program will stop itself.

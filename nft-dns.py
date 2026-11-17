@@ -52,43 +52,20 @@ class NFQueueHandler:
         """Setup nftables rules to redirect DNS to NFQUEUE."""
         self.cleanup_nftables()  # Clean up any leftover chains from previous runs
 
-        # Create chain for DNS OUTPUT
-        run_command("nft add chain ip filter nft_dns_output")
-        # Add rule to queue DNS output traffic
+        # Create dedicated chain for DNS OUTPUT with HIGH priority (negative = evaluated first)
+        # This ensures our DNS rules are evaluated BEFORE any existing OUTPUT rules
+        run_command("nft add chain ip filter nft_dns_output { type filter hook output priority -10; policy accept; }")
         run_command(f"nft add rule ip filter nft_dns_output udp dport 53 queue num {self.queue_num}")
-        # Add rule in OUTPUT chain to jump to our chain
-        run_command("nft add rule ip filter OUTPUT ip protocol udp udp dport 53 counter jump nft_dns_output")
-        logger.info(f"Added nftables OUTPUT rule for NFQUEUE {self.queue_num}")
+        logger.info(f"Added nftables nft_dns_output chain for NFQUEUE {self.queue_num} (priority -10)")
 
-        # Create chain for DNS INPUT (capture responses from DNS server)
-        run_command("nft add chain ip filter nft_dns_input")
+        # Create dedicated chain for DNS INPUT with HIGH priority
+        run_command("nft add chain ip filter nft_dns_input { type filter hook input priority -10; policy accept; }")
         run_command(f"nft add rule ip filter nft_dns_input udp sport 53 queue num {self.queue_num}")
-        run_command("nft add rule ip filter INPUT ip protocol udp udp sport 53 counter jump nft_dns_input")
-        logger.info(f"Added nftables INPUT rule for NFQUEUE {self.queue_num}")
+        logger.info(f"Added nftables nft_dns_input chain for NFQUEUE {self.queue_num} (priority -10)")
 
     def cleanup_nftables(self) -> None:
         """Remove nftables rules for NFQUEUE."""
-        # Delete rules in OUTPUT/INPUT that jump to our chains
-        # Use || true to handle cases where chains don't exist yet
-        res = run_command("nft -a list chain ip filter OUTPUT 2>/dev/null || true")
-        if res:
-            for line in res.split("\n"):
-                if "jump nft_dns_output" in line:
-                    match = re.search(r"handle (\d+)", line)
-                    if match:
-                        handle = match.group(1)
-                        run_command(f"nft delete rule ip filter OUTPUT handle {handle}")
-
-        res = run_command("nft -a list chain ip filter INPUT 2>/dev/null || true")
-        if res:
-            for line in res.split("\n"):
-                if "jump nft_dns_input" in line:
-                    match = re.search(r"handle (\d+)", line)
-                    if match:
-                        handle = match.group(1)
-                        run_command(f"nft delete rule ip filter INPUT handle {handle}")
-
-        # Delete our chains (this also removes the rules inside them)
+        # Delete our dedicated chains (they have their own hooks, no need to delete rules from OUTPUT/INPUT)
         run_command("nft delete chain ip filter nft_dns_output 2>/dev/null || true")
         run_command("nft delete chain ip filter nft_dns_input 2>/dev/null || true")
         logger.info("Removed nftables rules for NFQUEUE")

@@ -21,13 +21,19 @@ wheels = [
 ]
 
 [[package]]
+name = "netfilterqueue"
+version = "1.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/79/1e/216bc353a860a7baa580573e6e161343e88c29b80badc778a60b6bcebb74/NetfilterQueue-1.1.0.tar.gz", hash = "sha256:e30eff999325617f54bd95b3d8d3353214cc77b5e3188f90ec3a6f6288888d72", size = 90337, upload-time = "2023-03-01T08:01:40.211Z" }
+
+[[package]]
 name = "nft-dns"
 version = "0.8"
 source = { virtual = "." }
 dependencies = [
     { name = "dnspython" },
+    { name = "netfilterqueue" },
     { name = "pydantic" },
-    { name = "ruff" },
 ]
 
 [package.dev-dependencies]
@@ -38,8 +44,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "dnspython", specifier = "==2.7.0" },
+    { name = "netfilterqueue", specifier = "==1.1.0" },
     { name = "pydantic", specifier = "==2.10.6" },
-    { name = "ruff", specifier = ">=0.17.3" },
 ]
 
 [package.metadata.requires-dev]
