@@ -239,7 +239,7 @@ class NFQueueHandler:
                     f"NFQUEUE DNS response: {domain} -> {ip_list}, record type={target_rdtype_name}, nftables set={configured_entry.family}/{configured_entry.table}/{configured_entry.set_name}"
                 )
 
-                run_command(f"nft -exist add element {configured_entry.family} {configured_entry.table} {configured_entry.set_name} {{ {elements} }}")
+                run_command(f"nft add element {configured_entry.family} {configured_entry.table} {configured_entry.set_name} {{ {elements} }}")
 
         except (ValueError, AttributeError, IndexError, UnicodeDecodeError, dns.exception.FormError) as error:
             logger.debug(f"Invalid or unsupported DNS packet: {error}")
@@ -512,7 +512,7 @@ def apply_config_entry(one_entry: entry.ModelEntry, old_ip_list: list[IPvAnyAddr
 
     if one_entry.ip_list:
         new_elements = ", ".join(str(ip_address) for ip_address in one_entry.ip_list)
-        run_command(f"nft -exist add element {one_entry.family} {one_entry.table} {one_entry.set_name} {{ {new_elements} }}")
+        run_command(f"nft add element {one_entry.family} {one_entry.table} {one_entry.set_name} {{ {new_elements} }}")
 
 
 def remove_config_entries() -> None:
