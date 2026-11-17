@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
+
 import argparse
 import configparser
 import logging
-import re
 import signal
 import subprocess
 import sys
@@ -11,367 +11,574 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from time import sleep
 
+import dns.exception
+import dns.flags
+import dns.message
+import dns.rdatatype
 import dns.resolver
 from pydantic import IPvAnyAddress
 
 import entry
 
-# Global singleton for NFQUEUE handler
-nfqueue_handler = None
-
 config = configparser.ConfigParser(interpolation=None)
 
 values = []
 stop_requested = False
+nfqueue_handler = None
+
 logging.basicConfig(format="%(asctime)s %(levelname)s:%(message)s")
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
+def is_dry_run() -> bool:
+    return args.dry_run or config["GLOBAL"].getboolean("dry_run", fallback=False)
+
+
+def run_command(cmd: str) -> str:
+    logger.debug(f"Command to run: {cmd}")
+
+    if is_dry_run():
+        logger.debug(f"Dry-run detected, command not executed: {cmd}")
+        return ""
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, shell=True)
+
+        if result.stdout:
+            logger.debug(f"Command stdout: {result.stdout.rstrip()}")
+
+        if result.stderr:
+            logger.debug(f"Command stderr: {result.stderr.rstrip()}")
+
+        return result.stdout
+
+    except subprocess.CalledProcessError as error:
+        logger.error(f"Command failed with return code {error.returncode}: {cmd}")
+
+        if error.stdout:
+            logger.error(f"Command stdout: {error.stdout.rstrip()}")
+
+        if error.stderr:
+            logger.error(f"Command stderr: {error.stderr.rstrip()}")
+
+        return ""
+
+    except FileNotFoundError:
+        logger.error("The nft command was not found. Install nftables or use --dry-run to prevent nftables commands from being executed.")
+        sys.exit(1)
+
+
 class NFQueueHandler:
-    """NFQUEUE handler for capturing DNS responses. Singleton - only one instance allowed."""
+    """NFQUEUE handler used to capture DNS responses. Only one instance is allowed."""
 
     _instance = None
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is not None:
-            raise RuntimeError("Only one NFQueueHandler instance allowed")
-        return super().__new__(cls)
+            raise RuntimeError("Only one NFQueueHandler instance is allowed")
 
-    def __init__(self, queue_num: int = 1, values: list | None = None):
+        instance = super().__new__(cls)
+        cls._instance = instance
+        return instance
+
+    def __init__(self, queue_num: int = 0, values: list | None = None):
         if hasattr(self, "_initialized"):
-            return  # Prevent re-initialization
+            return
+
         self.queue_num = queue_num
-        self.values = values if values is not None else []  # shared reference to entries
+        self.values = values if values is not None else []
         self.nfqueue = None
         self._thread = None
         self._stop_event = threading.Event()
         self._initialized = True
 
     def setup_nftables(self) -> None:
-        """Setup nftables rules to redirect DNS to NFQUEUE."""
-        self.cleanup_nftables()  # Clean up any leftover chains from previous runs
+        """Create nftables base chains and redirect DNS UDP packets to NFQUEUE."""
 
-        # Create dedicated chain for DNS OUTPUT with HIGH priority (negative = evaluated first)
-        # This ensures our DNS rules are evaluated BEFORE any existing OUTPUT rules
+        self.cleanup_nftables()
+
         run_command("nft 'add chain ip filter nft_dns_output { type filter hook output priority -10; policy accept; }'")
         run_command(f"nft 'add rule ip filter nft_dns_output udp dport 53 queue num {self.queue_num}'")
-        logger.info(f"Added nftables nft_dns_output chain for NFQUEUE {self.queue_num} (priority -10)")
+        logger.info(f"Added nftables nft_dns_output chain for NFQUEUE {self.queue_num} with priority -10")
 
-        # Create dedicated chain for DNS INPUT with HIGH priority
         run_command("nft 'add chain ip filter nft_dns_input { type filter hook input priority -10; policy accept; }'")
         run_command(f"nft 'add rule ip filter nft_dns_input udp sport 53 queue num {self.queue_num}'")
-        logger.info(f"Added nftables nft_dns_input chain for NFQUEUE {self.queue_num} (priority -10)")
+        logger.info(f"Added nftables nft_dns_input chain for NFQUEUE {self.queue_num} with priority -10")
 
     def cleanup_nftables(self) -> None:
-        """Remove nftables rules for NFQUEUE."""
-        # Delete our dedicated chains (they have their own hooks, no need to delete rules from OUTPUT/INPUT)
+        """Remove nftables chains used by NFQUEUE."""
+
         run_command("nft delete chain ip filter nft_dns_output 2>/dev/null || true")
         run_command("nft delete chain ip filter nft_dns_input 2>/dev/null || true")
+
         logger.info("Removed nftables rules for NFQUEUE")
 
-    def process_packet(self, pkt):
-        """Callback for NetfilterQueue to process DNS packets."""
-        import dns.message
+    @staticmethod
+    def extract_dns_payload(raw_data: bytes) -> bytes | None:
+        """Extract the DNS payload from an IPv4 or IPv6 UDP packet."""
 
-        logger.debug(f"Packet received, payload len={len(pkt.get_payload())}")
+        if not raw_data:
+            logger.debug("Received an empty NFQUEUE packet")
+            return None
+
+        ip_version = raw_data[0] >> 4
+
+        if ip_version == 4:
+            if len(raw_data) < 20:
+                logger.debug(f"Received truncated IPv4 packet with length {len(raw_data)}")
+                return None
+
+            ip_header_len = (raw_data[0] & 0x0F) * 4
+
+            if ip_header_len < 20:
+                logger.debug(f"Invalid IPv4 header length: {ip_header_len}")
+                return None
+
+            if len(raw_data) < ip_header_len + 8:
+                logger.debug(f"IPv4 packet is too short to contain a UDP header: packet length={len(raw_data)}, IP header length={ip_header_len}")
+                return None
+
+            ip_protocol = raw_data[9]
+
+            if ip_protocol != 17:
+                logger.debug(f"Ignoring non-UDP IPv4 packet with protocol number {ip_protocol}")
+                return None
+
+        elif ip_version == 6:
+            if len(raw_data) < 48:
+                logger.debug(f"Received truncated IPv6 packet with length {len(raw_data)}")
+                return None
+
+            ip_header_len = 40
+            next_header = raw_data[6]
+
+            if next_header != 17:
+                logger.debug(f"Ignoring IPv6 packet with next-header value {next_header}. IPv6 extension headers are not supported by this parser.")
+                return None
+
+        else:
+            logger.debug(f"Unsupported IP version: {ip_version}")
+            return None
+
+        dns_offset = ip_header_len + 8
+
+        if len(raw_data) < dns_offset + 12:
+            logger.debug(f"Packet is too short to contain a complete DNS header: packet length={len(raw_data)}, DNS offset={dns_offset}")
+            return None
+
+        return raw_data[dns_offset:]
+
+    def get_matching_entries(self, domain: str) -> list:
+        """Return every configured entry matching the DNS query domain."""
+
+        normalized_domain = domain.rstrip(".").lower()
+        return [configured_entry for configured_entry in self.values if configured_entry.fqdn.rstrip(".").lower() == normalized_domain]
+
+    @staticmethod
+    def get_record_addresses(message: dns.message.Message, target_rdtype: dns.rdatatype.RdataType) -> list[str]:
+        """Extract unique A or AAAA addresses from the DNS answer section."""
+
+        addresses = []
+
+        for rrset in message.answer:
+            if rrset.rdtype != target_rdtype:
+                continue
+
+            for record in rrset:
+                if hasattr(record, "address"):
+                    addresses.append(record.address)
+
+        return sorted(set(addresses))
+
+    def process_packet(self, pkt) -> None:
+        """Process a DNS packet received through NFQUEUE."""
 
         try:
-            # Get raw packet payload (IP layer payload = UDP header + DNS data)
             raw_data = pkt.get_payload()
+            logger.debug(f"Packet received, payload length={len(raw_data)}")
 
-            # Extract IP header length based on version
-            ip_version = raw_data[0] >> 4
-            if ip_version == 4:
-                # IPv4: IHL field (lower 4 bits) gives header length in 4-byte words
-                ip_header_len = (raw_data[0] & 0x0F) * 4
-            elif ip_version == 6:
-                # IPv6: fixed 40-byte header, no options
-                ip_header_len = 40
-            else:
-                logger.warning(f"Unknown IP version: {ip_version}")
-                pkt.accept()
+            dns_data = self.extract_dns_payload(raw_data)
+
+            if dns_data is None:
                 return
 
-            # Skip IP header, then UDP header (8 bytes)
-            dns_data = raw_data[ip_header_len + 8 :]
+            message = dns.message.from_wire(dns_data)
 
-            # Parse DNS message from wire format
-            msg = dns.message.from_wire(dns_data)
+            logger.debug(
+                f"DNS packet parsed: class={type(message).__name__}, flags=0x{message.flags:04x}, response={bool(message.flags & dns.flags.QR)}, questions={len(message.question)}, answers={len(message.answer)}"
+            )
 
-            # DNS header is 12 bytes: ID(2) + FLAGS(2) + QDCOUNT(2) + ANCOUNT(2) + NSCOUNT(2) + ARCOUNT(2)
-            # QR bit is bit 15 of flags (0x80 of flags high byte)
-            dns_flags_bytes = dns_data[2:4].hex() if len(dns_data) >= 4 else "N/A"
-            logger.debug(f"DNS packet type: {type(msg).__name__}, hasattr response: {hasattr(msg, 'response')}, dns header bytes: {dns_flags_bytes}")
+            if not message.flags & dns.flags.QR:
+                logger.debug("Ignoring DNS query because the QR response flag is not set")
+                return
 
-            if hasattr(msg, "response") and msg.response:
-                if not self.values:
-                    pkt.accept()
-                    return
-                template = self.values[0]
+            if not message.question:
+                logger.debug("Ignoring DNS response without a question section")
+                return
 
-                # Determine which record type to extract based on set type
-                # typeof 4 = ipv4_addr (A records), typeof 6 = ipv6_addr (AAAA records)
-                target_rdtype = 1 if template.typeof == 4 else 28  # 1=A, 28=AAAA
+            domain = message.question[0].name.to_text().rstrip(".")
+            matching_entries = self.get_matching_entries(domain)
 
-                ip_list = []
-                domain = None
+            if not matching_entries:
+                logger.debug(f"Ignoring DNS response for unconfigured domain: {domain}")
+                return
 
-                # Extract query name from question section
-                if msg.question:
-                    q = msg.question[0]
-                    domain = q.name.to_text().rstrip(".")
+            for configured_entry in matching_entries:
+                target_rdtype = dns.rdatatype.A if configured_entry.typeof == 4 else dns.rdatatype.AAAA
+                target_rdtype_name = dns.rdatatype.to_text(target_rdtype)
+                ip_list = self.get_record_addresses(message, target_rdtype)
 
-                # Extract answer records
-                if msg.answer:
-                    for rr in msg.answer:
-                        if rr.rdtype == target_rdtype:
-                            for item in rr:
-                                ip_list.append(str(item))
+                if not ip_list:
+                    logger.debug(f"No {target_rdtype_name} addresses found in the DNS response for {domain}")
+                    continue
 
-                if ip_list and domain:
-                    logger.info(f"NFQUEUE DNS response: {domain} -> {ip_list}")
-                    run_command(f"nft add element {template.family} {template.table} {template.set_name} {{{', '.join(ip_list)}}}")
+                elements = ", ".join(ip_list)
 
-            pkt.accept()
-        except (ValueError, AttributeError, IndexError, UnicodeDecodeError, dns.exception.FormError) as e:
-            # Paquet DNS invalide ou structure inattendue - on accepte quand même
-            logger.debug(f"Invalid DNS packet: {e}")
-            pkt.accept()
+                logger.info(
+                    f"NFQUEUE DNS response: {domain} -> {ip_list}, record type={target_rdtype_name}, nftables set={configured_entry.family}/{configured_entry.table}/{configured_entry.set_name}"
+                )
 
-    def _loop(self):
-        """Main loop running in thread."""
+                run_command(f"nft -exist add element {configured_entry.family} {configured_entry.table} {configured_entry.set_name} {{ {elements} }}")
+
+        except (ValueError, AttributeError, IndexError, UnicodeDecodeError, dns.exception.FormError) as error:
+            logger.debug(f"Invalid or unsupported DNS packet: {error}")
+
+        except Exception as error:
+            logger.exception(f"Unexpected error while processing an NFQUEUE packet: {error}")
+
+        finally:
+            try:
+                pkt.accept()
+            except Exception as error:
+                logger.error(f"Unable to accept NFQUEUE packet: {error}")
+
+    def _loop(self) -> None:
+        """Run the NFQUEUE event loop in a dedicated thread."""
+
         from netfilterqueue import NetfilterQueue
 
-        self.setup_nftables()
-
-        self.nfqueue = NetfilterQueue()
-        self.nfqueue.bind(self.queue_num, self.process_packet)
-        logger.info(f"Starting NFQUEUE {self.queue_num} capture")
         try:
-            self.nfqueue.run()
-        except OSError as e:
-            logger.error(f"NFQUEUE error: {e}")
-        finally:
-            self.cleanup_nftables()
+            self.setup_nftables()
 
-    def start(self):
+            self.nfqueue = NetfilterQueue()
+            self.nfqueue.bind(self.queue_num, self.process_packet)
+
+            logger.info(f"Starting NFQUEUE {self.queue_num} capture")
+
+            self.nfqueue.run()
+
+        except OSError as error:
+            logger.error(f"NFQUEUE operating system error: {error}")
+
+        except Exception as error:
+            logger.exception(f"Unexpected NFQUEUE error: {error}")
+
+        finally:
+            if self.nfqueue:
+                try:
+                    self.nfqueue.unbind()
+                except Exception:
+                    pass
+
+                self.nfqueue = None
+
+            self.cleanup_nftables()
+            logger.info(f"NFQUEUE {self.queue_num} capture loop stopped")
+
+    def start(self) -> None:
         """Start NFQUEUE capture in a daemon thread."""
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+        if self._thread and self._thread.is_alive():
+            logger.warning(f"NFQUEUE {self.queue_num} capture is already running")
+            return
+
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, name=f"nfqueue-{self.queue_num}", daemon=True)
         self._thread.start()
 
-    def stop(self):
-        """Stop NFQUEUE capture."""
+    def stop(self) -> None:
+        """Stop NFQUEUE capture and wait briefly for the thread."""
+
         self._stop_event.set()
+
         if self.nfqueue:
-            self.nfqueue.unbind()
-            self.nfqueue = None
-        logger.info("NFQUEUE stopped")
+            try:
+                self.nfqueue.unbind()
+            except OSError as error:
+                logger.debug(f"NFQUEUE was already unbound: {error}")
+            except Exception as error:
+                logger.error(f"Unable to unbind NFQUEUE {self.queue_num}: {error}")
+
+        if self._thread and self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=2)
+
+        self.nfqueue = None
+        NFQueueHandler._instance = None
+
+        logger.info(f"NFQUEUE {self.queue_num} stopped")
 
 
-def read_config():
-    if args.config_file and Path(args.config_file).is_file():
-        logger.info(f"Reading config file : {Path(args.config_file).absolute()}")
-        config.read(Path(args.config_file))
-    else:
-        logger.error("Config file not found, Exiting...")
+def configure_logging() -> None:
+    verbose = args.verbose or config["GLOBAL"].getboolean("verbose", fallback=False)
+    log_level = logging.DEBUG if verbose else logging.INFO
+    log_format = "%(asctime)s %(levelname)-8s: %(message)s - <%(filename)s:%(funcName)s:L%(lineno)d>" if verbose else "%(asctime)s %(levelname)s:%(message)s"
+
+    logging.basicConfig(level=log_level, format=log_format, force=True)
+
+
+def read_config() -> None:
+    global nfqueue_handler
+
+    if not args.config_file or not Path(args.config_file).is_file():
+        logger.error(f"Config file not found: {args.config_file}")
         sys.exit(1)
+
+    config_file = Path(args.config_file)
+
+    logger.info(f"Reading config file: {config_file.absolute()}")
+    config.read(config_file)
+
+    if not config.has_section("GLOBAL"):
+        logger.error("The configuration file does not contain a GLOBAL section")
+        sys.exit(1)
+
     if config.has_option("GLOBAL", "include_config_dir"):
         config_dir = Path(config["GLOBAL"]["include_config_dir"])
-        if not config_dir.is_dir():
-            logger.error("Config directory is not a directory, Ignoring...")
-        else:
-            logger.info("Only config file with prefix .conf is read")
-            logger.info(f"Reading config directory : {config_dir.absolute()}")
-            list_config = list(config_dir.glob("*.conf"))
-            [logger.info(f"   {i}") for i in list_config]
-            config.read(list_config)
-    logger.info("# Parsing the configuration")
-    if args.verbose or (config.has_option("GLOBAL", "verbose") and config["GLOBAL"].getboolean("verbose")):
-        logging.getLogger().setLevel(logging.DEBUG)
-        logging.basicConfig(format="%(asctime)s %(levelname)-8s: %(message)s - <%(filename)s:%(funcName)s:L%(lineno)d>")
-    else:
-        logging.basicConfig(format="%(asctime)s %(levelname)s:%(message)s")
 
-    # Start NFQUEUE capture if configured
-    if config.has_option("GLOBAL", "mode") and config["GLOBAL"]["mode"] == "capture":
-        global nfqueue_handler
-        nfqueue_handler = NFQueueHandler(queue_num=0, values=values)  # 0 = auto-assign by kernel
-        nfqueue_handler.start()
+        if not config_dir.is_dir():
+            logger.error(f"Config directory is not a directory and will be ignored: {config_dir}")
+        else:
+            logger.info(f"Reading configuration files with the .conf extension from: {config_dir.absolute()}")
+
+            config_files = sorted(config_dir.glob("*.conf"))
+
+            for included_config_file in config_files:
+                logger.info(f"Reading included configuration file: {included_config_file}")
+
+            config.read(config_files)
+
+    configure_logging()
+
+    logger.info("# Parsing the configuration")
 
     for section in config.sections():
-        if section != "GLOBAL" and config[section].getboolean("enable", fallback=False):
-            for fqdn in config[section]["domains"].split(","):
-                if config[section].get("family", "") in ["ip", "ip6", "inet"]:
-                    family = config[section]["family"]
-                else:
-                    logger.error(f"Config error, family of {fqdn} is not : ip, ip6 or inet")
-                    sys.exit(1)
-                table = config[section].get("table", fallback="filter")
-                res = run_command(f"nft list set {family} {table} {config[section]['set_name']}")
-                if not res:
-                    logger.error(f"The named set '{family} {table} {config[section]['set_name']}' hasn't been found")
-                    sys.exit(1)
-                typeof = 4
-                if not (args.dry_run or (config.has_option("GLOBAL", "verbose") and config["GLOBAL"].getboolean("dry_run", fallback=False))):
-                    if "type ipv4_addr" in res:
-                        typeof = 4
-                        logger.debug(f"set {config[section]['set_name']} well defined in ipv4_addr family")
-                    elif "type ipv6_addr" in res:
-                        typeof = 6
-                        logger.debug(f"set {config[section]['set_name']} well defined in ipv6_addr family")
-                    else:
-                        logger.error(f'Type of the {config[section]["set_name"]} set not defined to "ipv4_addr" or "ipv6_addr" into the nftables set. Only theses type are allowed.')
-                        sys.exit(1)
-                else:
-                    logger.info('The dry_run option forces typeof to "ipv4" since nft list set command will not be executed to detect the type')
-                result = entry.ModelEntry(
-                    set_name=config[section]["set_name"],
-                    family=family,
-                    table=table,
-                    typeof=typeof,
-                    fqdn=fqdn.strip(),
-                    ip_list=None,
-                    ttl=None,
-                    next_update=None,
-                )
-                values.append(result)
-                logger.debug(result)
-    if len(values) == 0:
-        logger.error("No entries configurated, I've nothing to do, Exiting in tears...")
+        if section == "GLOBAL":
+            continue
+
+        if not config[section].getboolean("enable", fallback=False):
+            logger.debug(f"Ignoring disabled configuration section: {section}")
+            continue
+
+        if not config[section].get("domains", fallback="").strip():
+            logger.error(f"The configuration section {section} does not contain any domain")
+            sys.exit(1)
+
+        if not config[section].get("set_name", fallback="").strip():
+            logger.error(f"The configuration section {section} does not contain a set_name")
+            sys.exit(1)
+
+        family = config[section].get("family", fallback="")
+
+        if family not in {"ip", "ip6", "inet"}:
+            logger.error(f"Invalid nftables family in section {section}: {family}. Allowed values are ip, ip6 and inet.")
+            sys.exit(1)
+
+        table = config[section].get("table", fallback="filter")
+        set_name = config[section]["set_name"]
+
+        nft_set_definition = run_command(f"nft list set {family} {table} {set_name}")
+
+        if not is_dry_run() and not nft_set_definition:
+            logger.error(f"The nftables set '{family} {table} {set_name}' was not found")
+            sys.exit(1)
+
+        if is_dry_run():
+            address_type = 4
+            logger.info(f"Dry-run mode forces set {set_name} to IPv4 because the nftables set definition cannot be inspected")
+        elif "type ipv4_addr" in nft_set_definition:
+            address_type = 4
+            logger.debug(f"Set {set_name} is correctly defined with type ipv4_addr")
+        elif "type ipv6_addr" in nft_set_definition:
+            address_type = 6
+            logger.debug(f"Set {set_name} is correctly defined with type ipv6_addr")
+        else:
+            logger.error(f'The nftables set "{family} {table} {set_name}" does not use type ipv4_addr or ipv6_addr. Only these address types are supported.')
+            sys.exit(1)
+
+        for fqdn in config[section]["domains"].split(","):
+            normalized_fqdn = fqdn.strip().rstrip(".")
+
+            if not normalized_fqdn:
+                continue
+
+            model_entry = entry.ModelEntry(
+                set_name=set_name,
+                family=family,
+                table=table,
+                typeof=address_type,
+                fqdn=normalized_fqdn,
+                ip_list=None,
+                ttl=None,
+                next_update=None,
+            )
+
+            values.append(model_entry)
+            logger.debug(f"Loaded configuration entry: {model_entry}")
+
+    if not values:
+        logger.error("No enabled or valid entries were configured, exiting")
         sys.exit(1)
 
-    logger.info("# End of Parsing")
+    if config["GLOBAL"].get("mode", fallback="poll").lower() == "capture":
+        nfqueue_handler = NFQueueHandler(queue_num=0, values=values)
+        nfqueue_handler.start()
+
+    logger.info("# End of parsing")
 
 
 def update_dns() -> None:
-    global values
     if config.has_option("GLOBAL", "custom_resolver"):
-        res = dns.resolver.make_resolver_at(config["GLOBAL"]["custom_resolver"])
+        resolver = dns.resolver.make_resolver_at(config["GLOBAL"]["custom_resolver"])
     else:
-        res = dns.resolver.Resolver()
+        resolver = dns.resolver.Resolver()
 
     max_ttl = config["GLOBAL"].getint("max_ttl", fallback=86400)
     min_ttl = config["GLOBAL"].getint("min_ttl", fallback=300)
 
-    for i in values:
-        if i.next_update and i.next_update > datetime.now():
+    for configured_entry in values:
+        if configured_entry.next_update and configured_entry.next_update > datetime.now():
             continue
-        old_ip_list = i.ip_list
-        logger.debug(f"Update for {i} in progress...")
+
+        old_ip_list = configured_entry.ip_list
+
+        logger.debug(f"DNS update for {configured_entry} is in progress")
+
         try:
-            rd_type = "A"
-            if i.typeof == 6:
-                rd_type = "AAAA"
-            answer = res.resolve(i.fqdn, rdtype=rd_type)
-            i.ip_list = [items.address for items in answer.rrset]
-            i.ip_list.sort()
-            i.ttl = answer.rrset.ttl
-            logger.info(f"DNS resolution: {i.fqdn} -> {i.ip_list} (TTL: {i.ttl})")
-            # calcul next update for this entry
-            ttl_adjusted = max(min(i.ttl, max_ttl) + 1, min_ttl)  # Value between min_ttl and max_ttl
-            i.next_update = datetime.now() + timedelta(seconds=ttl_adjusted + 1)  # +2 To be sure the cache is really cleared
+            record_type = "AAAA" if configured_entry.typeof == 6 else "A"
+            answer = resolver.resolve(configured_entry.fqdn, rdtype=record_type)
+
+            configured_entry.ip_list = sorted([record.address for record in answer.rrset])
+            configured_entry.ttl = answer.rrset.ttl
+
+            adjusted_ttl = max(min(configured_entry.ttl, max_ttl), min_ttl)
+            configured_entry.next_update = datetime.now() + timedelta(seconds=adjusted_ttl + 1)
+
+            logger.info(f"DNS resolution: {configured_entry.fqdn} -> {configured_entry.ip_list}, type={record_type}, DNS TTL={configured_entry.ttl}, effective TTL={adjusted_ttl}")
+
         except dns.resolver.NXDOMAIN:
-            logger.warning(f'Impossible to get the fqdn of "{i.fqdn}" from the "{i.set_name}" set, disabling.')
+            configured_entry.next_update = datetime.now() + timedelta(seconds=min_ttl)
+            logger.warning(f'Domain "{configured_entry.fqdn}" does not exist according to the configured resolver. A new attempt will be made in {min_ttl} seconds.')
             continue
-        logger.debug(i)
-        if old_ip_list != i.ip_list:
-            logger.info(f"Updating the IPv{i.typeof} for {i.fqdn} with {i.ip_list}")
-            apply_config_entry(i, old_ip_list=old_ip_list)
+
+        except dns.resolver.NoAnswer:
+            configured_entry.next_update = datetime.now() + timedelta(seconds=min_ttl)
+            logger.warning(f'No usable DNS answer was returned for "{configured_entry.fqdn}". A new attempt will be made in {min_ttl} seconds.')
+            continue
+
+        except dns.resolver.NoNameservers:
+            configured_entry.next_update = datetime.now() + timedelta(seconds=min_ttl)
+            logger.warning(f'No DNS nameserver was able to answer for "{configured_entry.fqdn}". A new attempt will be made in {min_ttl} seconds.')
+            continue
+
+        except dns.exception.Timeout:
+            configured_entry.next_update = datetime.now() + timedelta(seconds=min_ttl)
+            logger.warning(f'DNS resolution timed out for "{configured_entry.fqdn}". A new attempt will be made in {min_ttl} seconds.')
+            continue
+
+        logger.debug(f"Updated entry: {configured_entry}")
+
+        if old_ip_list != configured_entry.ip_list:
+            logger.info(f"Updating IPv{configured_entry.typeof} addresses for {configured_entry.fqdn}: old={old_ip_list}, new={configured_entry.ip_list}")
+            apply_config_entry(configured_entry, old_ip_list=old_ip_list)
         else:
-            logger.debug(f"Nothing have change for the IPv{i.typeof} for {i.fqdn}")
-    values = [i for i in values if i.ip_list is not None and i.next_update is not None]
+            logger.debug(f"No IPv{configured_entry.typeof} address change detected for {configured_entry.fqdn}")
 
 
 def get_next_run_timer() -> datetime:
-    valid_values = [date.next_update for date in values if date.next_update is not None]
-    if not valid_values:
+    valid_next_update_values = [configured_entry.next_update for configured_entry in values if configured_entry.next_update is not None]
+
+    if not valid_next_update_values:
         min_ttl = config["GLOBAL"].getint("min_ttl", fallback=300)
         return datetime.now() + timedelta(seconds=min_ttl)
-    return min(valid_values)
+
+    return min(valid_next_update_values)
 
 
 def apply_config_entry(one_entry: entry.ModelEntry, old_ip_list: list[IPvAnyAddress] | None) -> None:
     if old_ip_list:
-        run_command(f"nft delete element {one_entry.family} {one_entry.table} {one_entry.set_name} {{{', '.join([str(ip) for ip in old_ip_list])}}}")
+        old_elements = ", ".join(str(ip_address) for ip_address in old_ip_list)
+        run_command(f"nft delete element {one_entry.family} {one_entry.table} {one_entry.set_name} {{ {old_elements} }}")
 
     if one_entry.ip_list:
-        run_command(f"nft add element {one_entry.family} {one_entry.table} {one_entry.set_name} {{{', '.join([str(ip) for ip in one_entry.ip_list])}}}")
+        new_elements = ", ".join(str(ip_address) for ip_address in one_entry.ip_list)
+        run_command(f"nft -exist add element {one_entry.family} {one_entry.table} {one_entry.set_name} {{ {new_elements} }}")
 
 
-def remove_config_entries():
-    logger.info("Cleaning all managed named sets")
-    managed_sets = {(i.family, i.table, i.set_name) for i in values}
+def remove_config_entries() -> None:
+    logger.info("Cleaning all managed nftables sets")
+
+    managed_sets = {(configured_entry.family, configured_entry.table, configured_entry.set_name) for configured_entry in values}
+
     for family, table, set_name in managed_sets:
-        # run_command(f"nft delete element {i.family} {i.table} {i.set_name} {{{', '.join([str(ip) for ip in i.ip_list])}}}")
         run_command(f"nft flush set {family} {table} {set_name}")
 
 
-def run_command(cmd: str):
-    logger.debug(f"Command to run : {cmd}")
-    if not (args.dry_run or (config.has_option("GLOBAL", "verbose") and config["GLOBAL"].getboolean("dry_run", fallback=False))):
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True, shell=True)
-            return res.stdout
-        except subprocess.CalledProcessError as e:
-            logger.error(e.stdout)
-            logger.error(e.stderr)
-            return ""
-        except FileNotFoundError:
-            logger.error("The nft command isn't found, Run with --dry-run to avoid nftable change tries")
-            sys.exit(1)
-    else:
-        logger.debug("Dry-run detected, logging only, the previous command isn't executed")
-        return ""
-
-
-def run_loop():
+def shutdown() -> None:
     global nfqueue_handler
-    is_capture_mode = config.has_option("GLOBAL", "mode") and config["GLOBAL"]["mode"] == "capture"
-    while True:
-        # In capture mode, only NFQUEUE populates the set - skip DNS polling
-        if not is_capture_mode:
-            update_dns()
-        next_run = get_next_run_timer()
-        sleep_second = (next_run - datetime.now()).seconds + 1  # +1 because the sleep is rounded to the second
-        logger.info(f"Sleeping for {sleep_second}s")
 
-        for i in range(sleep_second):
-            sleep(1)
-            if stop_requested:
-                if nfqueue_handler:
-                    nfqueue_handler.cleanup_nftables()  # Delete chains and rules before stopping
-                    nfqueue_handler.stop()
-                    nfqueue_handler = None
-                remove_config_entries()
-                break
-        if stop_requested:
-            break
+    if nfqueue_handler:
+        nfqueue_handler.stop()
+        nfqueue_handler = None
+
+    remove_config_entries()
 
 
-def main():
+def run_loop() -> None:
+    is_capture_mode = config["GLOBAL"].get("mode", fallback="poll").lower() == "capture"
+
+    try:
+        while not stop_requested:
+            if not is_capture_mode:
+                update_dns()
+
+            next_run = get_next_run_timer()
+            sleep_seconds = max(1, int((next_run - datetime.now()).total_seconds()) + 1)
+
+            logger.info(f"Sleeping for {sleep_seconds}s")
+
+            for _ in range(sleep_seconds):
+                if stop_requested:
+                    break
+
+                sleep(1)
+
+    finally:
+        shutdown()
+
+
+def handler_stop(signum, frame) -> None:
+    global stop_requested
+
+    signal_name = signal.Signals(signum).name
+    logger.warning(f"{signal_name}({signum}) signal received, shutdown requested")
+
+    stop_requested = True
+
+
+def main() -> None:
     read_config()
     run_loop()
 
 
-def handler_stop(signum, frame):
-    logger.warning(f"{signal.Signals(signum).name}({signum}) signal received. Exiting")
-    global stop_requested, nfqueue_handler
-    stop_requested = True
-    if nfqueue_handler:
-        nfqueue_handler.cleanup_nftables()  # Delete chains and rules before stopping
-        nfqueue_handler.stop()
-        nfqueue_handler = None
-    remove_config_entries()
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DNS plugin for NFTables")
-    parser.add_argument("-c", "--config", type=str, dest="config_file", default="/etc/nft-dns.conf", help="Config file")
-    parser.add_argument("-t", "--dry-run", dest="dry_run", action="store_true", help="Test Mode, dry-run will not run any nftables command, usefull with verbose mode")
-    parser.add_argument("-v", "--verbose", dest="verbose", action="store_true", help="Verbose logging mode, will log all actions")
+    parser = argparse.ArgumentParser(description="DNS plugin for nftables")
+    parser.add_argument("-c", "--config", type=str, dest="config_file", default="/etc/nft-dns.conf", help="Configuration file")
+    parser.add_argument("-t", "--dry-run", dest="dry_run", action="store_true", help="Test mode. No nftables command will be executed.")
+    parser.add_argument("-v", "--verbose", dest="verbose", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
 
-    signal.signal(signal.SIGINT, handler_stop)  # For simple CTRL+C
-    signal.signal(signal.SIGTERM, handler_stop)  # For Systemd stop
+    signal.signal(signal.SIGINT, handler_stop)
+    signal.signal(signal.SIGTERM, handler_stop)
+
     main()
