@@ -54,13 +54,13 @@ class NFQueueHandler:
 
         # Create dedicated chain for DNS OUTPUT with HIGH priority (negative = evaluated first)
         # This ensures our DNS rules are evaluated BEFORE any existing OUTPUT rules
-        run_command("nft add chain ip filter nft_dns_output { type filter hook output priority -10; policy accept; }")
-        run_command(f"nft add rule ip filter nft_dns_output udp dport 53 queue num {self.queue_num}")
+        run_command("nft 'add chain ip filter nft_dns_output { type filter hook output priority -10; policy accept; }'")
+        run_command(f"nft 'add rule ip filter nft_dns_output udp dport 53 queue num {self.queue_num}'")
         logger.info(f"Added nftables nft_dns_output chain for NFQUEUE {self.queue_num} (priority -10)")
 
         # Create dedicated chain for DNS INPUT with HIGH priority
-        run_command("nft add chain ip filter nft_dns_input { type filter hook input priority -10; policy accept; }")
-        run_command(f"nft add rule ip filter nft_dns_input udp sport 53 queue num {self.queue_num}")
+        run_command("nft 'add chain ip filter nft_dns_input { type filter hook input priority -10; policy accept; }'")
+        run_command(f"nft 'add rule ip filter nft_dns_input udp sport 53 queue num {self.queue_num}'")
         logger.info(f"Added nftables nft_dns_input chain for NFQUEUE {self.queue_num} (priority -10)")
 
     def cleanup_nftables(self) -> None:
