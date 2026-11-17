@@ -70,4 +70,4 @@ Use `nft-dns.py --help` to get the usage help.
 Use `man nft-dns` to get the config help
 
 ## TODO
-1. pcap capture (as option) to support true wildcard
+- [x] NFQUEUE capture (as option) to support true wildcard

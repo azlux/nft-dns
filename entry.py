@@ -1,7 +1,6 @@
 import datetime
 
 from pydantic import BaseModel, IPvAnyAddress
-from typing import List
 
 
 class ModelEntry(BaseModel):
@@ -10,6 +9,6 @@ class ModelEntry(BaseModel):
     family: str
     typeof: int
     table: str
-    ip_list: List[IPvAnyAddress] | None
+    ip_list: list[IPvAnyAddress] | None
     ttl: int | None
     next_update: datetime.datetime | None

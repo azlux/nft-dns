@@ -25,6 +25,51 @@ Only .conf file will be read.
 
 you can use `/etc/nft-dns.conf` as an example for your configuration. All parameter of all section are present (but mostly commented)
 
+## NFTABLES SETUP
+Before using nft-dns, you need to create the named sets in your nftables configuration. These sets must be **exclusive** to nft-dns (not used by other rules directly, only nft-dns will modify them).
+
+### IPv4 set example
+```bash
+# Create a set for IPv4 addresses
+nft add table ip filter
+nft add set ip filter ALLOW-DNS { type ipv4_addr \\; flags interval \\; }
+```
+
+### IPv6 set example
+```bash
+# Create a set for IPv6 addresses
+nft add table ip6 filter
+nft add set ip6 filter ALLOW-DNS-6 { type ipv6_addr \\; flags interval \\; }
+```
+
+### Using the set in a rule
+Once the set is created and populated by nft-dns, you can use it in your firewall rules:
+```bash
+# Allow DNS traffic to IPs in the set
+nft add rule ip filter INPUT udp dport 53 ip saddr @ALLOW-DNS accept
+
+# Block DNS to IPs not in the set (if you want to force using the set)
+# nft add rule ip filter INPUT udp dport 53 ip saddr != @ALLOW-DNS drop
+```
+
+### Persistent configuration
+To make these sets permanent, add them to your nftables.conf (usually in `/etc/nftables.conf`):
+```nft
+table ip filter {
+    set ALLOW-DNS {
+        type ipv4_addr
+        flags interval
+    }
+}
+
+table ip6 filter {
+    set ALLOW-DNS-6 {
+        type ipv6_addr
+        flags interval
+    }
+}
+```
+
 ## GLOBAL section
 This section modify the program. This section is **optional** and can be removed into custom config from `/etc/nft-dns.d/*` if you don't need customization.
 
@@ -42,10 +87,6 @@ This section modify the program. This section is **optional** and can be removed
   Default: `300`
   Limit of the min TTL, don't allow a refresh be lower than this value.
   This can be impacting is you have fast DNS change (*e.g. deb.debian.org have a 30s TTL*), so you may want to lower this value.
-
-- `mode` (str)
-
-  not implemented yet
 
 - `custom_resolver` (ip)
 
@@ -68,6 +109,15 @@ This section modify the program. This section is **optional** and can be removed
   Default (explicit into the package): `/etc/nft-dns.d/`
   If removed, not include will be done.
   This is the path for custom configuration. It's a **Directory**. All `.conf` files inside this folder will be read as part of the configuration.
+
+- `mode` (str)
+
+  Default: not set (disabled)
+  If set to `capture`, the program will use NFQUEUE to capture DNS responses and automatically add resolved IPs to the configured set. This enables true wildcard support where any DNS response will have its IP addresses extracted and added to the nftables set before being forwarded to the client.
+
+  The queue number is automatically assigned by the kernel, no configuration needed.
+
+  Example: `mode = capture`
 
 ## Other sections
 All others sections are your fqdn resolutions configuration.

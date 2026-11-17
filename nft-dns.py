@@ -2,9 +2,11 @@
 import argparse
 import configparser
 import logging
+import re
 import signal
 import subprocess
 import sys
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import sleep
@@ -13,6 +15,9 @@ import dns.resolver
 from pydantic import IPvAnyAddress
 
 import entry
+
+# Global singleton for NFQUEUE handler
+nfqueue_handler = None
 
 config = configparser.ConfigParser(interpolation=None)
 
@@ -23,8 +28,171 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
+class NFQueueHandler:
+    """NFQUEUE handler for capturing DNS responses. Singleton - only one instance allowed."""
+
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is not None:
+            raise RuntimeError("Only one NFQueueHandler instance allowed")
+        return super().__new__(cls)
+
+    def __init__(self, queue_num: int = 1, values: list | None = None):
+        if hasattr(self, "_initialized"):
+            return  # Prevent re-initialization
+        self.queue_num = queue_num
+        self.values = values if values is not None else []  # shared reference to entries
+        self.nfqueue = None
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._initialized = True
+
+    def setup_nftables(self) -> None:
+        """Setup nftables rules to redirect DNS to NFQUEUE."""
+        self.cleanup_nftables()  # Clean up any leftover chains from previous runs
+
+        # Create chain for DNS OUTPUT
+        run_command("nft add chain ip filter nft_dns_output")
+        # Add rule to queue DNS output traffic
+        run_command(f"nft add rule ip filter nft_dns_output udp dport 53 queue num {self.queue_num}")
+        # Add rule in OUTPUT chain to jump to our chain
+        run_command("nft add rule ip filter OUTPUT ip protocol udp udp dport 53 counter jump nft_dns_output")
+        logger.info(f"Added nftables OUTPUT rule for NFQUEUE {self.queue_num}")
+
+        # Create chain for DNS INPUT (capture responses from DNS server)
+        run_command("nft add chain ip filter nft_dns_input")
+        run_command(f"nft add rule ip filter nft_dns_input udp sport 53 queue num {self.queue_num}")
+        run_command("nft add rule ip filter INPUT ip protocol udp udp sport 53 counter jump nft_dns_input")
+        logger.info(f"Added nftables INPUT rule for NFQUEUE {self.queue_num}")
+
+    def cleanup_nftables(self) -> None:
+        """Remove nftables rules for NFQUEUE."""
+        # Delete rules in OUTPUT/INPUT that jump to our chains
+        # Use || true to handle cases where chains don't exist yet
+        res = run_command("nft -a list chain ip filter OUTPUT 2>/dev/null || true")
+        if res:
+            for line in res.split("\n"):
+                if "jump nft_dns_output" in line:
+                    match = re.search(r"handle (\d+)", line)
+                    if match:
+                        handle = match.group(1)
+                        run_command(f"nft delete rule ip filter OUTPUT handle {handle}")
+
+        res = run_command("nft -a list chain ip filter INPUT 2>/dev/null || true")
+        if res:
+            for line in res.split("\n"):
+                if "jump nft_dns_input" in line:
+                    match = re.search(r"handle (\d+)", line)
+                    if match:
+                        handle = match.group(1)
+                        run_command(f"nft delete rule ip filter INPUT handle {handle}")
+
+        # Delete our chains (this also removes the rules inside them)
+        run_command("nft delete chain ip filter nft_dns_output 2>/dev/null || true")
+        run_command("nft delete chain ip filter nft_dns_input 2>/dev/null || true")
+        logger.info("Removed nftables rules for NFQUEUE")
+
+    def process_packet(self, pkt):
+        """Callback for NetfilterQueue to process DNS packets."""
+        import dns.message
+
+        logger.debug(f"Packet received, payload len={len(pkt.get_payload())}")
+
+        try:
+            # Get raw packet payload (IP layer payload = UDP header + DNS data)
+            raw_data = pkt.get_payload()
+
+            # Extract IP header length based on version
+            ip_version = raw_data[0] >> 4
+            if ip_version == 4:
+                # IPv4: IHL field (lower 4 bits) gives header length in 4-byte words
+                ip_header_len = (raw_data[0] & 0x0F) * 4
+            elif ip_version == 6:
+                # IPv6: fixed 40-byte header, no options
+                ip_header_len = 40
+            else:
+                logger.warning(f"Unknown IP version: {ip_version}")
+                pkt.accept()
+                return
+
+            # Skip IP header, then UDP header (8 bytes)
+            dns_data = raw_data[ip_header_len + 8 :]
+
+            # Parse DNS message from wire format
+            msg = dns.message.from_wire(dns_data)
+
+            # DNS header is 12 bytes: ID(2) + FLAGS(2) + QDCOUNT(2) + ANCOUNT(2) + NSCOUNT(2) + ARCOUNT(2)
+            # QR bit is bit 15 of flags (0x80 of flags high byte)
+            dns_flags_bytes = dns_data[2:4].hex() if len(dns_data) >= 4 else "N/A"
+            logger.debug(f"DNS packet type: {type(msg).__name__}, hasattr response: {hasattr(msg, 'response')}, dns header bytes: {dns_flags_bytes}")
+
+            if hasattr(msg, "response") and msg.response:
+                if not self.values:
+                    pkt.accept()
+                    return
+                template = self.values[0]
+
+                # Determine which record type to extract based on set type
+                # typeof 4 = ipv4_addr (A records), typeof 6 = ipv6_addr (AAAA records)
+                target_rdtype = 1 if template.typeof == 4 else 28  # 1=A, 28=AAAA
+
+                ip_list = []
+                domain = None
+
+                # Extract query name from question section
+                if msg.question:
+                    q = msg.question[0]
+                    domain = q.name.to_text().rstrip(".")
+
+                # Extract answer records
+                if msg.answer:
+                    for rr in msg.answer:
+                        if rr.rdtype == target_rdtype:
+                            for item in rr:
+                                ip_list.append(str(item))
+
+                if ip_list and domain:
+                    logger.info(f"NFQUEUE DNS response: {domain} -> {ip_list}")
+                    run_command(f"nft add element {template.family} {template.table} {template.set_name} {{{', '.join(ip_list)}}}")
+
+            pkt.accept()
+        except (ValueError, AttributeError, IndexError, UnicodeDecodeError, dns.exception.FormError) as e:
+            # Paquet DNS invalide ou structure inattendue - on accepte quand même
+            logger.debug(f"Invalid DNS packet: {e}")
+            pkt.accept()
+
+    def _loop(self):
+        """Main loop running in thread."""
+        from netfilterqueue import NetfilterQueue
+
+        self.setup_nftables()
+
+        self.nfqueue = NetfilterQueue()
+        self.nfqueue.bind(self.queue_num, self.process_packet)
+        logger.info(f"Starting NFQUEUE {self.queue_num} capture")
+        try:
+            self.nfqueue.run()
+        except OSError as e:
+            logger.error(f"NFQUEUE error: {e}")
+        finally:
+            self.cleanup_nftables()
+
+    def start(self):
+        """Start NFQUEUE capture in a daemon thread."""
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stop NFQUEUE capture."""
+        self._stop_event.set()
+        if self.nfqueue:
+            self.nfqueue.unbind()
+            self.nfqueue = None
+        logger.info("NFQUEUE stopped")
+
+
 def read_config():
-    global values
     if args.config_file and Path(args.config_file).is_file():
         logger.info(f"Reading config file : {Path(args.config_file).absolute()}")
         config.read(Path(args.config_file))
@@ -44,6 +212,15 @@ def read_config():
     logger.info("# Parsing the configuration")
     if args.verbose or (config.has_option("GLOBAL", "verbose") and config["GLOBAL"].getboolean("verbose")):
         logging.getLogger().setLevel(logging.DEBUG)
+        logging.basicConfig(format="%(asctime)s %(levelname)-8s: %(message)s - <%(filename)s:%(funcName)s:L%(lineno)d>")
+    else:
+        logging.basicConfig(format="%(asctime)s %(levelname)s:%(message)s")
+
+    # Start NFQUEUE capture if configured
+    if config.has_option("GLOBAL", "mode") and config["GLOBAL"]["mode"] == "capture":
+        global nfqueue_handler
+        nfqueue_handler = NFQueueHandler(queue_num=0, values=values)  # 0 = auto-assign by kernel
+        nfqueue_handler.start()
 
     for section in config.sections():
         if section != "GLOBAL" and config[section].getboolean("enable", fallback=False):
@@ -70,7 +247,7 @@ def read_config():
                         logger.error(f'Type of the {config[section]["set_name"]} set not defined to "ipv4_addr" or "ipv6_addr" into the nftables set. Only theses type are allowed.')
                         sys.exit(1)
                 else:
-                    logger.info('The dry_run option force the typeof to "ipv4" since not command are executed to check that')
+                    logger.info('The dry_run option forces typeof to "ipv4" since nft list set command will not be executed to detect the type')
                 result = entry.ModelEntry(
                     set_name=config[section]["set_name"],
                     family=family,
@@ -79,7 +256,8 @@ def read_config():
                     fqdn=fqdn.strip(),
                     ip_list=None,
                     ttl=None,
-                    next_update=None, )
+                    next_update=None,
+                )
                 values.append(result)
                 logger.debug(result)
     if len(values) == 0:
@@ -112,6 +290,7 @@ def update_dns() -> None:
             i.ip_list = [items.address for items in answer.rrset]
             i.ip_list.sort()
             i.ttl = answer.rrset.ttl
+            logger.info(f"DNS resolution: {i.fqdn} -> {i.ip_list} (TTL: {i.ttl})")
             # calcul next update for this entry
             ttl_adjusted = max(min(i.ttl, max_ttl) + 1, min_ttl)  # Value between min_ttl and max_ttl
             i.next_update = datetime.now() + timedelta(seconds=ttl_adjusted + 1)  # +2 To be sure the cache is really cleared
@@ -124,11 +303,15 @@ def update_dns() -> None:
             apply_config_entry(i, old_ip_list=old_ip_list)
         else:
             logger.debug(f"Nothing have change for the IPv{i.typeof} for {i.fqdn}")
-    values = [i for i in values if i.ip_list is not None]
+    values = [i for i in values if i.ip_list is not None and i.next_update is not None]
 
 
 def get_next_run_timer() -> datetime:
-    return min([date.next_update for date in values])
+    valid_values = [date.next_update for date in values if date.next_update is not None]
+    if not valid_values:
+        min_ttl = config["GLOBAL"].getint("min_ttl", fallback=300)
+        return datetime.now() + timedelta(seconds=min_ttl)
+    return min(valid_values)
 
 
 def apply_config_entry(one_entry: entry.ModelEntry, old_ip_list: list[IPvAnyAddress] | None) -> None:
@@ -166,8 +349,12 @@ def run_command(cmd: str):
 
 
 def run_loop():
+    global nfqueue_handler
+    is_capture_mode = config.has_option("GLOBAL", "mode") and config["GLOBAL"]["mode"] == "capture"
     while True:
-        update_dns()
+        # In capture mode, only NFQUEUE populates the set - skip DNS polling
+        if not is_capture_mode:
+            update_dns()
         next_run = get_next_run_timer()
         sleep_second = (next_run - datetime.now()).seconds + 1  # +1 because the sleep is rounded to the second
         logger.info(f"Sleeping for {sleep_second}s")
@@ -175,6 +362,10 @@ def run_loop():
         for i in range(sleep_second):
             sleep(1)
             if stop_requested:
+                if nfqueue_handler:
+                    nfqueue_handler.cleanup_nftables()  # Delete chains and rules before stopping
+                    nfqueue_handler.stop()
+                    nfqueue_handler = None
                 remove_config_entries()
                 break
         if stop_requested:
@@ -188,8 +379,13 @@ def main():
 
 def handler_stop(signum, frame):
     logger.warning(f"{signal.Signals(signum).name}({signum}) signal received. Exiting")
-    global stop_requested
+    global stop_requested, nfqueue_handler
     stop_requested = True
+    if nfqueue_handler:
+        nfqueue_handler.cleanup_nftables()  # Delete chains and rules before stopping
+        nfqueue_handler.stop()
+        nfqueue_handler = None
+    remove_config_entries()
 
 
 if __name__ == "__main__":
